@@ -35,8 +35,14 @@ Architecture: any
 Depends: ${misc:Depends},
   regolith-wm-config,
   regolith-i3-dbus-activation
+# Only the -regolith variant provides regolith-{i3,sway}-control-center-default;
+# both variants provide regolith-{i3,sway}-control-center. On upgrade, apt acts
+# on an unsatisfied Recommends only if its first (classic solver) or last
+# (solver3) alternative is new. These names therefore restore the settings
+# integration once after an Ubuntu release upgrade removed it, and keep a
+# -gnome variant the user chose.
 Recommends: regolith-i3-compositor,
-  regolith-i3-control-center-regolith,
+  regolith-i3-control-center-default | regolith-i3-control-center,
   regolith-i3-default-style,
   regolith-i3-gaps,
   regolith-i3-i3xrocks,
@@ -51,9 +57,10 @@ Architecture: any
 Depends: ${misc:Depends},
   regolith-wm-config,
   regolith-sway-dbus-activation
+# See the comment on regolith-i3-root-config's Recommends.
 Recommends: regolith-sway-background,
   regolith-sway-clamshell,
-  regolith-sway-control-center-regolith | regolith-sway-control-center-gnome,
+  regolith-sway-control-center-default | regolith-sway-control-center,
   regolith-sway-default-style,
   regolith-sway-gaps,
   regolith-sway-grimshot,
@@ -198,7 +205,7 @@ Depends: ${misc:Depends},
   regolith-wm-config,
   regolith-control-center,
   gnome-settings-daemon
-Provides: regolith-wm-control-center
+Provides: regolith-wm-control-center, regolith-i3-control-center, regolith-i3-control-center-default
 Conflicts: regolith-wm-gnome, regolith-i3-control-center-gnome
 Replaces: regolith-wm-gnome, regolith-i3-control-center-gnome
 Description: regolith and gnome integrations for system management
@@ -210,7 +217,7 @@ Depends: ${misc:Depends},
   regolith-wm-config,
   regolith-control-center,
   gnome-settings-daemon
-Provides: regolith-wm-control-center
+Provides: regolith-wm-control-center, regolith-sway-control-center, regolith-sway-control-center-default
 Conflicts: regolith-wm-gnome, regolith-sway-control-center-gnome
 Replaces: regolith-wm-gnome, regolith-sway-control-center-gnome
 Description: regolith and gnome integrations for system management
@@ -222,7 +229,7 @@ Depends: ${misc:Depends},
   regolith-wm-config,
   gnome-control-center,
   gnome-settings-daemon
-Provides: regolith-wm-control-center
+Provides: regolith-wm-control-center, regolith-sway-control-center
 Conflicts: regolith-wm-gnome, regolith-sway-control-center-regolith
 Replaces: regolith-wm-gnome, regolith-sway-control-center-regolith
 Description: regolith and gnome integrations for system management
@@ -234,7 +241,7 @@ Depends: ${misc:Depends},
   regolith-wm-config,
   gnome-control-center,
   gnome-settings-daemon
-Provides: regolith-wm-control-center
+Provides: regolith-wm-control-center, regolith-i3-control-center
 Conflicts: regolith-wm-gnome, regolith-i3-control-center-regolith
 Replaces: regolith-wm-gnome, regolith-i3-control-center-regolith
 Description: gnome integrations for system management
