@@ -1,0 +1,1090 @@
+#!/usr/bin/python3
+"""Lock the X11 session with wm.program.lock_i3 on every lock path.
+
+  regolith-i3-lock-handler             handle the session's lock requests
+                                       (started by 55_session_keybindings)
+  regolith-i3-lock-handler --lock-key  the lock key: lock through the handler,
+                                       or run wm.program.lock_i3 itself
+
+In the sway session the lock program of wm.program.lock_sway locks the
+screen for the lock key, an idle session, suspend and logind's lock
+requests. In the X11 session gnome-flashback's lock screen answers all of
+these but the key, so a user who sets wm.program.lock_i3 and switches
+gnome-flashback's lock screen off gets no lock on idle or before suspend.
+This program gives such a session the sway session's behaviour.
+
+It handles lock requests while both of these hold, and follows both live:
+
+  - wm.program.lock_i3, read from the X server's resource database, names a
+    command other than the one 55_session_keybindings ships with;
+  - gnome-flashback's lock screen is off (org.gnome.gnome-flashback
+    screensaver is false).
+
+Otherwise it only watches, and the session behaves as without it. While it
+handles lock requests:
+
+  - logind's Lock and Unlock signals for the session start and end the lock
+    program (SIGTERM, then SIGKILL after two seconds);
+  - a logind delay inhibitor for sleep is held. Before suspend, with
+    org.gnome.desktop.screensaver lock-enabled and ubuntu-lock-on-suspend
+    on, the lock program is started and the inhibitor is let go once it has
+    been running for a moment, or at once when it has exited or could not
+    start, and in any case soon enough not to hold suspend up. Otherwise the
+    inhibitor is let go at once. Waking up takes a new one;
+  - while the GNOME session's presence is idle, with idle-activation-enabled
+    and lock-enabled on, the lock program is started after lock-delay
+    seconds, unless the session has left idle by then. This also holds when
+    handling starts while the session is already idle, and when
+    idle-activation-enabled or lock-enabled is switched on, or lockdown's
+    disable-lock-screen switched off, while it is. A change of lock-delay
+    moves a pending lock to the new delay, counted from where the pending
+    delay began (at once when that is already past);
+  - it owns org.gnome.ScreenSaver on the session bus: Lock, GetActive,
+    SetActive, GetActiveTime and ActiveChanged, as gnome-flashback has them;
+  - the session's logind LockedHint follows the lock;
+  - the lock key asks it to lock (org.regolith.i3.LockHandler.Lock);
+  - with org.gnome.desktop.lockdown disable-lock-screen on, none of these
+    paths locks, as with gnome-flashback's lock screen.
+
+The lock program is run the way i3 runs commands: wm.program.lock_i3 as a
+shell command line, with the session's environment, in a process group of
+its own. The screen is locked while any process of that group runs; the
+exit of the last one is the unlock, and only then can another lock program
+start. Only one lock program runs at a time. A command that can't run or
+exits at once is logged, counts as unlocked, and is not started again until
+the next lock request. Lock programs that leave their process group are not
+supported.
+
+The program exits when i3 exits or restarts (an i3 restart starts it again),
+and when a newer instance takes over its bus name (i3 reloads its
+configuration). A running lock program is left alone: its process group, and
+the time of its SIGKILL when an Unlock has asked it to exit, are kept on the
+root window (_REGOLITH_LOCK_PROGRAM), so the next instance carries on with it.
+When the next instance finds that the recorded program has exited in between,
+it reports that exit as the unlock the earlier instance could not report.
+
+It needs Python's D-Bus bindings and GObject introspection, gsettings and
+libX11; X resources are read through libX11 directly.
+"""
+
+import ctypes
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import Gio, GLib
+
+PROGRAM = "regolith-i3-lock-handler"
+
+# The resource and the default that 55_session_keybindings sets the lock key
+# from. With the default, gnome-flashback's lock screen locks the session.
+LOCK_RESOURCE = "wm.program.lock_i3"
+DEFAULT_LOCK_COMMAND = ("dbus-send --type=method_call --dest=org.gnome.ScreenSaver "
+                        "/org/gnome/ScreenSaver org.gnome.ScreenSaver.Lock")
+
+HANDLER_NAME = "org.regolith.i3.LockHandler"
+HANDLER_PATH = "/org/regolith/i3/LockHandler"
+HANDLER_IFACE = "org.regolith.i3.LockHandler"
+
+SCREENSAVER_NAME = "org.gnome.ScreenSaver"
+SCREENSAVER_PATH = "/org/gnome/ScreenSaver"
+SCREENSAVER_IFACE = "org.gnome.ScreenSaver"
+
+LOGIN1_NAME = "org.freedesktop.login1"
+LOGIN1_PATH = "/org/freedesktop/login1"
+LOGIN1_MANAGER_IFACE = "org.freedesktop.login1.Manager"
+LOGIN1_SESSION_IFACE = "org.freedesktop.login1.Session"
+
+SESSION_MANAGER_NAME = "org.gnome.SessionManager"
+PRESENCE_PATH = "/org/gnome/SessionManager/Presence"
+PRESENCE_IFACE = "org.gnome.SessionManager.Presence"
+PRESENCE_IDLE = 3
+
+FLASHBACK_SCHEMA = "org.gnome.gnome-flashback"
+SCREENSAVER_SCHEMA = "org.gnome.desktop.screensaver"
+LOCKDOWN_SCHEMA = "org.gnome.desktop.lockdown"
+
+# The desktop's settings that decide which paths lock, and the values used
+# where a key is missing (ubuntu-lock-on-suspend is Ubuntu's).
+SETTING_DEFAULTS = {
+    (SCREENSAVER_SCHEMA, "lock-enabled"): True,
+    (SCREENSAVER_SCHEMA, "lock-delay"): 0,
+    (SCREENSAVER_SCHEMA, "idle-activation-enabled"): True,
+    (SCREENSAVER_SCHEMA, "ubuntu-lock-on-suspend"): True,
+    (LOCKDOWN_SCHEMA, "disable-lock-screen"): False,
+}
+
+# How long the lock program runs before suspend may go on: half a second,
+# plus a little for the program itself to start after its shell.
+SLEEP_LOCK_SECONDS = 0.6
+# Suspend is never held up longer than this after PrepareForSleep.
+SLEEP_LIMIT_SECONDS = 1.5
+# Time a lock program gets to exit after SIGTERM, before SIGKILL, in ms.
+KILL_GRACE_MS = 2000
+# A lock program that exits sooner than this after starting is logged.
+QUICK_EXIT_SECONDS = 1.0
+
+STATE_PROPERTY = b"_REGOLITH_LOCK_PROGRAM"
+
+I3_IPC_MAGIC = b"i3-ipc"
+I3_IPC_SUBSCRIBE = 2
+I3_IPC_EVENT_SHUTDOWN = 0x80000006
+
+
+def warn(message):
+    print("%s: %s" % (PROGRAM, message), file=sys.stderr, flush=True)
+
+
+def normalise(command):
+    return " ".join(command.split())
+
+
+# -- X resources --------------------------------------------------------------
+
+
+class XrmValue(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint), ("addr", ctypes.c_void_p)]
+
+
+class XPropertyEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("window", ctypes.c_ulong), ("atom", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("state", ctypes.c_int)]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [("type", ctypes.c_int), ("xproperty", XPropertyEvent),
+                ("pad", ctypes.c_long * 24)]
+
+
+class XDisplay:
+    """The root window of $DISPLAY: its resource database and properties."""
+
+    XA_STRING = 31
+    PROPERTY_NOTIFY = 28
+    PROPERTY_CHANGE_MASK = 1 << 22
+
+    def __init__(self):
+        x = self.x = ctypes.CDLL("libX11.so.6")
+        ulong, voidp = ctypes.c_ulong, ctypes.c_void_p
+        x.XOpenDisplay.restype = voidp
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XDefaultRootWindow.restype = ulong
+        x.XDefaultRootWindow.argtypes = [voidp]
+        x.XInternAtom.restype = ulong
+        x.XInternAtom.argtypes = [voidp, ctypes.c_char_p, ctypes.c_int]
+        x.XGetWindowProperty.argtypes = [
+            voidp, ulong, ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int,
+            ulong, ctypes.POINTER(ulong), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ulong), ctypes.POINTER(ulong),
+            ctypes.POINTER(voidp)]
+        x.XChangeProperty.argtypes = [voidp, ulong, ulong, ulong, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        x.XDeleteProperty.argtypes = [voidp, ulong, ulong]
+        x.XSelectInput.argtypes = [voidp, ulong, ctypes.c_long]
+        x.XFlush.argtypes = [voidp]
+        x.XFree.argtypes = [voidp]
+        x.XPending.argtypes = [voidp]
+        x.XNextEvent.argtypes = [voidp, ctypes.POINTER(XEvent)]
+        x.XConnectionNumber.argtypes = [voidp]
+        x.XrmGetStringDatabase.restype = voidp
+        x.XrmGetStringDatabase.argtypes = [ctypes.c_char_p]
+        x.XrmGetResource.argtypes = [voidp, ctypes.c_char_p, ctypes.c_char_p,
+                                     ctypes.POINTER(ctypes.c_char_p),
+                                     ctypes.POINTER(XrmValue)]
+        x.XrmDestroyDatabase.argtypes = [voidp]
+
+        self.dpy = x.XOpenDisplay(None)
+        if not self.dpy:
+            raise RuntimeError("can't open the display %r"
+                               % os.environ.get("DISPLAY", ""))
+        x.XrmInitialize()
+        self.root = x.XDefaultRootWindow(self.dpy)
+        self.resource_manager = x.XInternAtom(self.dpy, b"RESOURCE_MANAGER", 0)
+        self.state_atom = x.XInternAtom(self.dpy, STATE_PROPERTY, 0)
+        self.on_resources_changed = None
+        self._change_pending = False
+
+    def get_property(self, atom):
+        """The root window's 8-bit property `atom` as bytes, or None."""
+        x = self.x
+        actual_type = ctypes.c_ulong()
+        actual_format = ctypes.c_int()
+        nitems = ctypes.c_ulong()
+        after = ctypes.c_ulong()
+        data = ctypes.c_void_p()
+        status = x.XGetWindowProperty(
+            self.dpy, self.root, atom, 0, 1 << 24, 0, 0,
+            ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(nitems), ctypes.byref(after), ctypes.byref(data))
+        try:
+            if status != 0 or not actual_type.value or actual_format.value != 8:
+                return None
+            return ctypes.string_at(data.value, nitems.value)
+        finally:
+            if data.value:
+                x.XFree(data)
+            self._queue_events()
+
+    def resource(self, name):
+        """The value of resource `name`, matched as i3's set_from_resource
+        matches it, or None when it is not set."""
+        text = self.get_property(self.resource_manager)
+        if not text:
+            return None
+        x = self.x
+        database = x.XrmGetStringDatabase(text)
+        if not database:
+            return None
+        try:
+            kind = ctypes.c_char_p()
+            value = XrmValue()
+            if not x.XrmGetResource(database, name.encode(), name.encode(),
+                                    ctypes.byref(kind), ctypes.byref(value)):
+                return None
+            raw = ctypes.string_at(value.addr, value.size)
+            return raw.rstrip(b"\0").decode("utf-8", "replace")
+        finally:
+            x.XrmDestroyDatabase(database)
+
+    def lock_command(self):
+        """wm.program.lock_i3 as i3 sets it: the resource, or the default."""
+        value = self.resource(LOCK_RESOURCE)
+        if value is None or not value.strip():
+            return DEFAULT_LOCK_COMMAND
+        return value.strip()
+
+    def custom_lock_command(self):
+        """wm.program.lock_i3 when it isn't the shipped default, else None."""
+        command = self.lock_command()
+        if normalise(command) == normalise(DEFAULT_LOCK_COMMAND):
+            return None
+        return command
+
+    def set_state(self, text):
+        x = self.x
+        if text is None:
+            x.XDeleteProperty(self.dpy, self.root, self.state_atom)
+        else:
+            data = text.encode()
+            x.XChangeProperty(self.dpy, self.root, self.state_atom,
+                              self.XA_STRING, 8, 0, data, len(data))
+        x.XFlush(self.dpy)
+        self._queue_events()
+
+    def get_state(self):
+        data = self.get_property(self.state_atom)
+        return data.decode("ascii", "replace") if data else None
+
+    def watch_resources(self, callback):
+        """Call `callback` from the main loop when the resources change."""
+        self.on_resources_changed = callback
+        self.x.XSelectInput(self.dpy, self.root, self.PROPERTY_CHANGE_MASK)
+        self.x.XFlush(self.dpy)
+        GLib.io_add_watch(self.x.XConnectionNumber(self.dpy),
+                          GLib.PRIORITY_DEFAULT, GLib.IO_IN,
+                          lambda *_args: self._queue_events() or True)
+
+    def _queue_events(self):
+        # Requests can read events into Xlib's queue, where the connection's
+        # file descriptor no longer shows them, so the queue is emptied after
+        # every request as well as when the descriptor is readable.
+        if self.on_resources_changed is None:
+            return
+        event = XEvent()
+        while self.x.XPending(self.dpy):
+            self.x.XNextEvent(self.dpy, ctypes.byref(event))
+            if (event.type == self.PROPERTY_NOTIFY
+                    and event.xproperty.atom == self.resource_manager
+                    and not self._change_pending):
+                self._change_pending = True
+                GLib.idle_add(self._resources_changed)
+
+    def _resources_changed(self):
+        self._change_pending = False
+        self.on_resources_changed()
+        return False
+
+
+# -- processes ----------------------------------------------------------------
+
+
+def process_stat(pid):
+    """The fields of /proc/<pid>/stat after the command name, or None."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as handle:
+            return handle.read().rsplit(b")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+
+
+def process_start_time(pid):
+    """The start time of process `pid` in clock ticks since boot, or None."""
+    fields = process_stat(pid)
+    try:
+        return int(fields[19])
+    except (TypeError, IndexError, ValueError):
+        return None
+
+
+def group_members(pgid):
+    """The processes of process group `pgid` that still run (zombies don't)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return []
+    except OSError:
+        pass
+    members = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        fields = process_stat(int(name))
+        try:
+            if fields[0] not in (b"Z", b"X") and int(fields[2]) == pgid:
+                members.append(int(name))
+        except (TypeError, IndexError, ValueError):
+            continue
+    return members
+
+
+def monotonic_ms():
+    """CLOCK_MONOTONIC in milliseconds. It is the same clock for every
+    process of the system, so a deadline on it can be handed on."""
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000000
+
+
+def started_since(start_time):
+    """time.monotonic() at a process start time given in clock ticks."""
+    try:
+        boottime = time.clock_gettime(time.CLOCK_BOOTTIME)
+        running = boottime - start_time / os.sysconf("SC_CLK_TCK")
+        return time.monotonic() - max(0.0, running)
+    except (OSError, ValueError):
+        return time.monotonic()
+
+
+class LockProgram:
+    """A running lock program: a process group of its own, led by the shell
+    that runs the command. It runs until every process of the group has
+    exited, whether the shell is still there or not."""
+
+    def __init__(self, pgid, start_time, proc=None, started=None):
+        self.pid = pgid
+        self.start_time = start_time
+        self.proc = proc
+        self.started = time.monotonic() if started is None else started
+        self.status = None
+        self.stopping = False
+        # When SIGKILL is due (monotonic_ms()) once an Unlock has sent SIGTERM.
+        self.kill_at = None
+        self.kill_timer = None
+        self.watched = {}
+        self.finished = False
+
+    def state(self):
+        text = "%d %d" % (self.pid, self.start_time or 0)
+        if self.kill_at is not None:
+            text += " %d" % self.kill_at
+        return text
+
+    def signal(self, signum):
+        try:
+            os.killpg(self.pid, signum)
+        except ProcessLookupError:
+            pass
+        except OSError as err:
+            warn("can't signal the lock program (%d): %s" % (self.pid, err))
+
+
+def adopt_lock_program(state):
+    """The lock program that an earlier instance started and recorded as
+    "<process group> <start time of its leader>[ <SIGKILL deadline>]", if it
+    still runs. The deadline is there when an Unlock has asked it to exit."""
+    try:
+        recorded = [int(field) for field in state.split()]
+    except (AttributeError, ValueError):
+        return None
+    if len(recorded) not in (2, 3):
+        return None
+    pgid, start_time = recorded[:2]
+    if pgid <= 1 or start_time <= 0:
+        return None
+    leader = process_stat(pgid)
+    if leader is not None and leader[0] not in (b"Z", b"X"):
+        # The leader is still there: it must be the same process.
+        try:
+            if int(leader[19]) != start_time or int(leader[2]) != pgid:
+                return None
+        except (IndexError, ValueError):
+            return None
+    else:
+        # The leader has gone, the rest of its group may not have. A group
+        # keeps its number while it has members, and the lock program's
+        # group is also its session.
+        sessions = set()
+        for pid in group_members(pgid):
+            fields = process_stat(pid)
+            if fields is not None:
+                sessions.add(int(fields[3]))
+        if sessions != {pgid}:
+            return None
+    program = LockProgram(pgid, start_time, started=started_since(start_time))
+    if len(recorded) == 3:
+        program.stopping = True
+        program.kill_at = recorded[2]
+    return program
+
+
+# -- i3 -----------------------------------------------------------------------
+
+
+class I3Watch:
+    """Calls `on_exit` when i3 exits or restarts, or its IPC socket closes."""
+
+    def __init__(self, on_exit):
+        self.on_exit = on_exit
+        path = os.environ.get("I3SOCK")
+        if not path:
+            path = subprocess.run(["i3", "--get-socketpath"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        payload = b'["shutdown"]'
+        self.sock.sendall(I3_IPC_MAGIC + struct.pack("=II", len(payload),
+                                                     I3_IPC_SUBSCRIBE) + payload)
+        self.buffer = b""
+        GLib.io_add_watch(self.sock.fileno(), GLib.PRIORITY_DEFAULT,
+                          GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._readable)
+
+    def _readable(self, *_args):
+        try:
+            data = self.sock.recv(65536)
+        except OSError:
+            data = b""
+        if not data:
+            self.on_exit("i3 closed its IPC connection")
+            return False
+        self.buffer += data
+        header = len(I3_IPC_MAGIC) + 8
+        while len(self.buffer) >= header:
+            length, kind = struct.unpack("=II", self.buffer[len(I3_IPC_MAGIC):header])
+            if len(self.buffer) < header + length:
+                break
+            payload = self.buffer[header:header + length]
+            self.buffer = self.buffer[header + length:]
+            if kind == I3_IPC_EVENT_SHUTDOWN:
+                self.on_exit("i3 is shutting down: %s"
+                             % payload.decode("utf-8", "replace"))
+                return False
+            if kind == I3_IPC_SUBSCRIBE and b'"success":true' not in payload:
+                self.on_exit("i3 refused the shutdown event subscription")
+                return False
+        return True
+
+
+# -- D-Bus interfaces -----------------------------------------------------------
+
+
+class HandlerInterface(dbus.service.Object):
+    def __init__(self, bus, handler):
+        super().__init__(bus, HANDLER_PATH)
+        self.handler = handler
+
+    @dbus.service.method(HANDLER_IFACE, in_signature="", out_signature="b")
+    def Lock(self):
+        """Lock for the lock key; false when not handling lock requests."""
+        return self.handler.request_lock("the lock key")
+
+
+class ScreenSaverInterface(dbus.service.Object):
+    def __init__(self, bus, handler):
+        super().__init__(bus, SCREENSAVER_PATH)
+        self.handler = handler
+
+    @dbus.service.method(SCREENSAVER_IFACE, in_signature="", out_signature="")
+    def Lock(self):
+        self.handler.request_lock("a ScreenSaver Lock call")
+
+    @dbus.service.method(SCREENSAVER_IFACE, in_signature="", out_signature="b")
+    def GetActive(self):
+        return self.handler.program is not None
+
+    @dbus.service.method(SCREENSAVER_IFACE, in_signature="b", out_signature="")
+    def SetActive(self, value):
+        if value:
+            self.handler.request_lock("a ScreenSaver SetActive call")
+
+    @dbus.service.method(SCREENSAVER_IFACE, in_signature="", out_signature="u")
+    def GetActiveTime(self):
+        program = self.handler.program
+        if program is None:
+            return dbus.UInt32(0)
+        return dbus.UInt32(max(0, int(time.monotonic() - program.started)))
+
+    @dbus.service.signal(SCREENSAVER_IFACE, signature="b")
+    def ActiveChanged(self, active):
+        pass
+
+
+# -- the handler ----------------------------------------------------------------
+
+
+class LockHandler:
+    def __init__(self, loop):
+        self.loop = loop
+        self.active = False
+        self.program = None
+        self.inhibitor = None
+        self.idle_timer = None
+        # time.monotonic() at which the pending idle lock's delay began.
+        self.idle_from = None
+        self.presence = None
+        self.sleep_timer = None
+        self.sleep_limit = None
+        self.sleep_waiting = False
+
+        self.session_bus = dbus.SessionBus()
+        reply = self.session_bus.request_name(
+            HANDLER_NAME, dbus.bus.NAME_FLAG_ALLOW_REPLACEMENT
+            | dbus.bus.NAME_FLAG_REPLACE_EXISTING | dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
+        if reply not in (dbus.bus.REQUEST_NAME_REPLY_PRIMARY_OWNER,
+                         dbus.bus.REQUEST_NAME_REPLY_ALREADY_OWNER):
+            raise RuntimeError("another %s is running" % PROGRAM)
+        self.session_bus.add_signal_receiver(
+            self._name_lost, "NameLost", "org.freedesktop.DBus",
+            "org.freedesktop.DBus", "/org/freedesktop/DBus")
+        self.handler_interface = HandlerInterface(self.session_bus, self)
+        self.screensaver = ScreenSaverInterface(self.session_bus, self)
+
+        self.display = XDisplay()
+        # Until the main loop runs, an adopted program only keeps any lock
+        # request from starting a second one.
+        recorded = self.display.get_state()
+        self.program = adopt_lock_program(recorded)
+
+        self.system_bus = dbus.SystemBus()
+        self.login_session = None
+        self.login_manager = dbus.Interface(
+            self.system_bus.get_object(LOGIN1_NAME, LOGIN1_PATH, introspect=False),
+            LOGIN1_MANAGER_IFACE)
+        session_id = os.environ.get("XDG_SESSION_ID")
+        try:
+            if session_id:
+                session_path = self.login_manager.GetSession(session_id)
+            else:
+                session_path = self.login_manager.GetSessionByPID(
+                    dbus.UInt32(os.getpid()))
+        except dbus.DBusException as err:
+            warn("no logind session, logind's lock requests are not handled: %s"
+                 % err.get_dbus_message())
+        else:
+            self.login_session = dbus.Interface(
+                self.system_bus.get_object(LOGIN1_NAME, session_path,
+                                           introspect=False),
+                LOGIN1_SESSION_IFACE)
+            for name, callback in (("Lock", self._logind_lock),
+                                   ("Unlock", self._logind_unlock)):
+                self.system_bus.add_signal_receiver(
+                    callback, name, LOGIN1_SESSION_IFACE, LOGIN1_NAME, session_path)
+        self.system_bus.add_signal_receiver(
+            self._prepare_for_sleep, "PrepareForSleep", LOGIN1_MANAGER_IFACE,
+            LOGIN1_NAME, LOGIN1_PATH)
+        self.session_bus.add_signal_receiver(
+            self._presence_changed, "StatusChanged", PRESENCE_IFACE,
+            SESSION_MANAGER_NAME, PRESENCE_PATH)
+
+        source = Gio.SettingsSchemaSource.get_default()
+        self.flashback = None
+        if source is not None and source.lookup(FLASHBACK_SCHEMA, True):
+            self.flashback = Gio.Settings.new(FLASHBACK_SCHEMA)
+            self.flashback.connect("changed::screensaver",
+                                   lambda *_args: self.update())
+        self.screensaver_settings = Gio.Settings.new(SCREENSAVER_SCHEMA)
+        for key, callback in (("lock-enabled", self._idle_setting_changed),
+                              ("idle-activation-enabled", self._idle_setting_changed),
+                              ("lock-delay", self._lock_delay_changed)):
+            self.screensaver_settings.connect("changed::" + key, callback)
+            # GSettings reports changes only of keys that have been read.
+            self.screensaver_settings.get_value(key)
+        self.lockdown_settings = None
+        self.lockdown_on = False
+        if source is not None and source.lookup(LOCKDOWN_SCHEMA, True):
+            self.lockdown_settings = Gio.Settings.new(LOCKDOWN_SCHEMA)
+            self.lockdown_settings.connect("changed::disable-lock-screen",
+                                           self._lockdown_changed)
+            self.lockdown_on = self.lockdown_settings.get_boolean(
+                "disable-lock-screen")
+
+        self.display.watch_resources(self.update)
+        self.i3 = I3Watch(self.stop)
+        self.update()
+        if self.program is not None:
+            GLib.idle_add(self._carry_on, self.program)
+        elif recorded is not None:
+            GLib.idle_add(self._finish_recorded, recorded)
+
+    # -- whether lock requests are handled
+
+    def update(self):
+        command = self.display.custom_lock_command()
+        flashback_locks = (self.flashback is not None
+                           and self.flashback.get_boolean("screensaver"))
+        if command is not None and not flashback_locks:
+            if not self.active:
+                self.active = True
+                warn("handling the session's lock requests with: %s" % command)
+                self.session_bus.request_name(SCREENSAVER_NAME, 0)
+                self._take_inhibitor()
+                # The session may be idle already: the idle rule applies
+                # from now on.
+                self.presence = self._presence_status()
+                self._idle_start()
+        elif self.active:
+            self.active = False
+            warn("leaving the session's lock requests to %s"
+                 % ("gnome-flashback" if command is not None
+                    else "the default lock command"))
+            self._step_back()
+
+    def _step_back(self):
+        """Stop handling lock requests; a running lock program stays."""
+        try:
+            self.session_bus.release_name(SCREENSAVER_NAME)
+        except dbus.DBusException:
+            pass
+        self._cancel_idle()
+        self._end_sleep_wait()
+        self._drop_inhibitor()
+
+    def stop(self, reason):
+        warn("exiting: %s" % reason)
+        self.active = False
+        self._step_back()
+        self.loop.quit()
+
+    def _name_lost(self, name):
+        if name == HANDLER_NAME:
+            self.stop("another %s took over" % PROGRAM)
+
+    # -- the desktop's settings
+
+    def _settings(self, *schemas):
+        """The current values of the keys in SETTING_DEFAULTS of `schemas`.
+
+        They are read through gsettings, not from this process's settings:
+        this process learns of a change made elsewhere only once the
+        backend's change notification reaches it, which can be after the
+        request that follows the change."""
+        values = {key: value for key, value in SETTING_DEFAULTS.items()
+                  if key[0] in schemas}
+        runs = []
+        for schema in schemas:
+            try:
+                runs.append((schema, subprocess.Popen(
+                    ["gsettings", "list-recursively", schema],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True)))
+            except OSError:
+                runs.append((schema, None))
+        for schema, proc in runs:
+            out = None
+            if proc is not None:
+                try:
+                    out = proc.communicate(timeout=5)[0]
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                if proc.returncode != 0:
+                    out = None
+            if out is None:
+                values.update(self._settings_in_process(schema, values))
+                continue
+            for line in out.splitlines():
+                fields = line.split(None, 2)
+                if len(fields) == 3 and (schema, fields[1]) in values:
+                    value = fields[2].strip()
+                    if value in ("true", "false"):
+                        values[schema, fields[1]] = value == "true"
+                    else:
+                        try:
+                            values[schema, fields[1]] = int(value.split()[-1])
+                        except ValueError:
+                            pass
+        return values
+
+    @staticmethod
+    def _settings_in_process(schema, values):
+        source = Gio.SettingsSchemaSource.get_default()
+        found = source.lookup(schema, True) if source is not None else None
+        if found is None:
+            return {}
+        settings = Gio.Settings.new(schema)
+        return {(schema, key): settings.get_value(key).unpack()
+                for key in found.list_keys() if (schema, key) in values}
+
+    def _lockdown(self):
+        """Whether org.gnome.desktop.lockdown forbids locking the screen."""
+        return self._settings(LOCKDOWN_SCHEMA)[LOCKDOWN_SCHEMA, "disable-lock-screen"]
+
+    # -- locking
+
+    def request_lock(self, reason, allowed=None):
+        """Start the lock program unless one runs; false when not handling.
+        `allowed` is the lockdown check when the caller has made it."""
+        if not self.active:
+            return False
+        if self.program is not None:
+            return True
+        if allowed is None:
+            allowed = not self._lockdown()
+        if not allowed:
+            warn("not locking for %s: org.gnome.desktop.lockdown "
+                 "disable-lock-screen is on" % reason)
+            return True
+        command = self.display.custom_lock_command()
+        if command is None:
+            return True
+        try:
+            proc = subprocess.Popen(["/bin/sh", "-c", command],
+                                    stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+        except OSError as err:
+            warn("can't run the lock program for %s: %s" % (reason, err))
+            return True
+        program = LockProgram(proc.pid, process_start_time(proc.pid), proc)
+        program.command = command
+        self.program = program
+        self._watch_group(program)
+        self.display.set_state(program.state())
+        self._set_locked(True)
+        return True
+
+    def unlock(self):
+        program = self.program
+        if program is None or program.stopping:
+            return
+        program.stopping = True
+        program.kill_at = monotonic_ms() + KILL_GRACE_MS
+        # Kept on the root window, so an instance started by an i3 restart in
+        # the meantime still sends SIGKILL on time.
+        self.display.set_state(program.state())
+        program.signal(signal.SIGTERM)
+        self._arm_kill(program)
+
+    @staticmethod
+    def _arm_kill(program):
+        """SIGKILL whatever is left of the lock program's process group at
+        its deadline (from the main loop, at once when it has passed)."""
+        def kill():
+            program.kill_timer = None
+            if not program.finished:
+                program.signal(signal.SIGKILL)
+            return False
+        left = max(0, program.kill_at - monotonic_ms())
+        program.kill_timer = GLib.timeout_add(left, kill)
+
+    def _carry_on(self, program):
+        """Carry on with a lock program an earlier instance started: watch
+        it, and when an Unlock has already asked it to exit, send SIGKILL at
+        the deadline that Unlock set."""
+        if program.kill_at is not None:
+            self._arm_kill(program)
+        self._watch_group(program)
+        return False
+
+    def _finish_recorded(self, recorded):
+        """An earlier instance recorded a lock program that has exited since,
+        before any instance could see it go (during an i3 restart): that exit
+        is the unlock, and it has not been reported yet. When the record has
+        changed meanwhile, its owner has reported it."""
+        if self.program is None and self.display.get_state() == recorded:
+            self.display.set_state(None)
+            self._set_locked(False)
+        return False
+
+    def _watch_group(self, program):
+        """Watch every running process of the lock program's group; when all
+        have exited, look again, and finish once none is left."""
+        if program.finished:
+            return False
+        members = [program.pid] if program.proc is not None and not program.watched \
+            and program.status is None else group_members(program.pid)
+        for pid in members:
+            if pid in program.watched:
+                continue
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError:
+                continue
+            program.watched[pid] = fd
+            GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN,
+                              lambda *_args, pid=pid: self._member_exited(program, pid))
+        if not program.watched:
+            # Reap our own child, in case it went before it could be watched.
+            self._reap_leader(program)
+            if not group_members(program.pid):
+                self._program_finished(program)
+            else:
+                GLib.timeout_add(50, self._watch_group, program)
+        return False
+
+    def _member_exited(self, program, pid):
+        fd = program.watched.pop(pid, None)
+        if fd is not None:
+            os.close(fd)
+        if pid == program.pid:
+            self._reap_leader(program)
+        if not program.watched:
+            self._watch_group(program)
+        return False
+
+    @staticmethod
+    def _reap_leader(program):
+        if program.proc is not None and program.status is None:
+            try:
+                program.status = program.proc.poll()
+            except ChildProcessError:
+                program.status = -1
+
+    def _program_finished(self, program):
+        program.finished = True
+        if program.kill_timer is not None:
+            GLib.source_remove(program.kill_timer)
+            program.kill_timer = None
+        if self.program is not program:
+            return
+        self.program = None
+        if self.display.get_state() == program.state():
+            self.display.set_state(None)
+        ran = time.monotonic() - program.started
+        command = getattr(program, "command", None)
+        if not program.stopping and command is not None and (
+                ran < QUICK_EXIT_SECONDS or program.status not in (0, None)):
+            warn("the lock program exited after %.1fs with status %s, so the "
+                 "session is not locked: %s" % (ran, program.status, command))
+        self._set_locked(False)
+        self._sleep_check()
+
+    def _set_locked(self, locked):
+        if self.active:
+            self.screensaver.ActiveChanged(locked)
+        if self.login_session is not None:
+            self.login_session.SetLockedHint(
+                locked, reply_handler=lambda: None,
+                error_handler=lambda err: warn(
+                    "can't set the session's locked hint: %s"
+                    % err.get_dbus_message()))
+
+    # -- logind
+
+    def _logind_lock(self):
+        self.request_lock("logind's Lock")
+
+    def _logind_unlock(self):
+        if self.active:
+            self.unlock()
+
+    def _take_inhibitor(self):
+        if self.inhibitor is not None or not self.active:
+            return
+        try:
+            fd = self.login_manager.Inhibit(
+                "sleep", "Regolith", "Lock the screen before the system suspends",
+                "delay")
+        except dbus.DBusException as err:
+            warn("can't take a sleep inhibitor: %s" % err.get_dbus_message())
+            return
+        self.inhibitor = fd.take()
+
+    def _drop_inhibitor(self):
+        if self.inhibitor is not None:
+            os.close(self.inhibitor)
+            self.inhibitor = None
+
+    def _prepare_for_sleep(self, sleeping):
+        if not self.active:
+            return
+        arrived = time.monotonic()
+        self._end_sleep_wait()
+        if not sleeping:
+            self._take_inhibitor()
+            return
+        settings = self._settings(SCREENSAVER_SCHEMA, LOCKDOWN_SCHEMA)
+        allowed = not settings[LOCKDOWN_SCHEMA, "disable-lock-screen"]
+        if not (allowed and settings[SCREENSAVER_SCHEMA, "lock-enabled"]
+                and settings[SCREENSAVER_SCHEMA, "ubuntu-lock-on-suspend"]):
+            self._drop_inhibitor()
+            return
+        self.request_lock("suspend", allowed)
+        if self.inhibitor is None:
+            return
+        self.sleep_waiting = True
+        left = arrived + SLEEP_LIMIT_SECONDS - time.monotonic()
+        self.sleep_limit = GLib.timeout_add(max(0, int(left * 1000)),
+                                            self._sleep_ready)
+        self._sleep_check()
+
+    def _sleep_check(self):
+        """Let suspend go on once the lock program has run long enough, or at
+        once when there is none."""
+        if not self.sleep_waiting:
+            return
+        if self.sleep_timer is not None:
+            GLib.source_remove(self.sleep_timer)
+            self.sleep_timer = None
+        if self.program is None:
+            self._sleep_ready()
+            return
+        left = self.program.started + SLEEP_LOCK_SECONDS - time.monotonic()
+        if left <= 0:
+            self._sleep_ready()
+        else:
+            self.sleep_timer = GLib.timeout_add(int(left * 1000) + 1,
+                                                self._sleep_timer_done)
+
+    def _sleep_timer_done(self):
+        self.sleep_timer = None
+        self._sleep_check()
+        return False
+
+    def _sleep_ready(self):
+        self.sleep_limit = None
+        self._end_sleep_wait()
+        self._drop_inhibitor()
+        return False
+
+    def _end_sleep_wait(self):
+        self.sleep_waiting = False
+        for name in ("sleep_timer", "sleep_limit"):
+            source = getattr(self, name)
+            if source is not None:
+                GLib.source_remove(source)
+                setattr(self, name, None)
+
+    # -- idle
+
+    def _presence_status(self):
+        try:
+            presence = self.session_bus.get_object(
+                SESSION_MANAGER_NAME, PRESENCE_PATH, introspect=False)
+            return int(presence.Get(PRESENCE_IFACE, "status",
+                                    dbus_interface=dbus.PROPERTIES_IFACE,
+                                    timeout=5))
+        except (dbus.DBusException, TypeError, ValueError) as err:
+            warn("can't read the session's presence status: %s" % err)
+            return self.presence
+
+    def _presence_changed(self, status):
+        self.presence = int(status)
+        self._idle_start()
+
+    def _idle_start(self):
+        """Apply the idle rule from now: while the session is idle, lock after
+        lock-delay seconds, if the desktop's settings let idle lock."""
+        self._cancel_idle()
+        if not self.active or self.presence != PRESENCE_IDLE:
+            return
+        settings = self._settings(SCREENSAVER_SCHEMA)
+        if not self._idle_locks(settings):
+            return
+        delay = max(0, int(settings[SCREENSAVER_SCHEMA, "lock-delay"]))
+        self.idle_from = time.monotonic()
+        self.idle_timer = GLib.timeout_add(delay * 1000, self._idle_elapsed)
+
+    @staticmethod
+    def _idle_locks(settings):
+        return (settings[SCREENSAVER_SCHEMA, "idle-activation-enabled"]
+                and settings[SCREENSAVER_SCHEMA, "lock-enabled"])
+
+    def _idle_elapsed(self):
+        self.idle_timer = None
+        if (self.presence == PRESENCE_IDLE
+                and self._idle_locks(self._settings(SCREENSAVER_SCHEMA))):
+            self.request_lock("an idle session")
+        return False
+
+    def _cancel_idle(self):
+        if self.idle_timer is not None:
+            GLib.source_remove(self.idle_timer)
+            self.idle_timer = None
+
+    def _idle_setting_changed(self, settings, key):
+        if not settings.get_boolean(key):
+            self._cancel_idle()
+        elif self.idle_timer is None:
+            # Idle activation or locking switched on while the session is
+            # idle: the idle rule, lock-delay included, applies from now.
+            self._idle_start()
+
+    def _lock_delay_changed(self, settings, key):
+        """Move a pending idle lock to the new lock-delay, counted from where
+        its delay began; lock at once when that time is already past."""
+        if self.idle_timer is None:
+            return
+        try:
+            delay = max(0, int(settings.get_value(key).unpack()))
+        except (TypeError, ValueError):
+            return
+        GLib.source_remove(self.idle_timer)
+        left = self.idle_from + delay - time.monotonic()
+        self.idle_timer = GLib.timeout_add(max(0, int(left * 1000)),
+                                           self._idle_elapsed)
+
+    def _lockdown_changed(self, settings, key):
+        was_on, self.lockdown_on = self.lockdown_on, settings.get_boolean(key)
+        if was_on and not self.lockdown_on:
+            # Locking allowed again while the session is idle: the idle rule,
+            # with the full lock-delay, applies from now.
+            self._idle_start()
+
+
+# -- the lock key -----------------------------------------------------------------
+
+
+def lock_key():
+    """Lock through the handler while it handles lock requests; otherwise run
+    wm.program.lock_i3, as the key does without the handler."""
+    try:
+        handler = dbus.SessionBus().get_object(HANDLER_NAME, HANDLER_PATH,
+                                               introspect=False)
+        if handler.Lock(dbus_interface=HANDLER_IFACE, timeout=10):
+            return 0
+    except dbus.DBusException:
+        pass
+    try:
+        command = XDisplay().lock_command()
+    except (OSError, RuntimeError) as err:
+        warn("can't read %s, running the default: %s" % (LOCK_RESOURCE, err))
+        command = DEFAULT_LOCK_COMMAND
+    os.execv("/bin/sh", ["/bin/sh", "-c", command])
+
+
+def main():
+    if sys.argv[1:] == ["--lock-key"]:
+        return lock_key()
+    if sys.argv[1:]:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    loop = GLib.MainLoop()
+    try:
+        LockHandler(loop)
+    except (dbus.DBusException, OSError, RuntimeError) as err:
+        warn("not handling lock requests: %s" % err)
+        return 1
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -41,7 +41,15 @@ bindsym $mod+$wm.binding.shutdown exec $wm.program.shutdown
 ## Session // Lock Screen // <> Escape ##
 set_from_resource $wm.binding.lock wm.binding.lock Escape
 set_from_resource $wm.program.lock_i3 wm.program.lock_i3 dbus-send --type=method_call --dest=org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver.Lock
-bindsym $mod+$wm.binding.lock exec $wm.program.lock_i3
+bindsym $mod+$wm.binding.lock exec regolith-i3-lock-handler --lock-key
+
+# With a lock program of its own in wm.program.lock_i3 and gnome-flashback's
+# lock screen off (org.gnome.gnome-flashback screensaver false), the session
+# locks with that program on idle, before suspend and on logind's and the
+# ScreenSaver interface's lock requests too, as the sway session does. The
+# lock key goes through the same handler, so one lock program runs at a time;
+# otherwise the key runs wm.program.lock_i3 as before.
+exec_always --no-startup-id regolith-i3-lock-handler
 
 ## Session // Sleep // <><Shift> s ##
 set_from_resource $wm.binding.sleep wm.binding.sleep Shift+s
